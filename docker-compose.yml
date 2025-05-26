@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newage-price-scraper
+    env_file:
+      - .env
+    volumes:
+      - ./output:/app/output
+      - ./config:/app/config
+      # Add /tmp volume for Chrome
+      - /tmp:/tmp
+    command: >
+      sh -c "
+        node parallelArchiveScraper.js \
+          --start ${START_DATE} \
+          --end ${END_DATE} \
+          --workers ${WORKERS} \
+          --commodities \"${COMMODITIES}\" \
+          --config /app/config/commodities.json
+      "
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: '2.0'
+    restart: on-failure:3
+    shm_size: 2gb  # Critical: Shared memory for Chrome
+    security_opt:
+      - seccomp:unconfined  # Allow Chrome to run properly
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=2048
+      - DISPLAY=:99
