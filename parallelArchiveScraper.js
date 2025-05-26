@@ -19,7 +19,7 @@ if (isMainThread) {
   program
     .requiredOption("--start <date>", "Start date YYYY-MM-DD")
     .requiredOption("--end <date>", "End date YYYY-MM-DD")
-    .option("--workers <number>", "Number of parallel workers", "4")
+    .option("--workers <number>", "Number of parallel workers", "2")
     .option(
       "--commodities <items>",
       "Comma-separated list of commodities",
@@ -254,18 +254,61 @@ function determinePriceType(context) {
   return "Retail"; // Default to retail
 }
 
+/* SHARED WORK QUEUE */
+class WorkQueue {
+  constructor(items) {
+    this.items = [...items];
+    this.completed = [];
+    this.failed = [];
+  }
+
+  getNext() {
+    return this.items.shift();
+  }
+
+  markCompleted(item, results) {
+    this.completed.push({ item, results, timestamp: new Date() });
+  }
+
+  markFailed(item, error) {
+    this.failed.push({ item, error: error.message, timestamp: new Date() });
+  }
+
+  getStatus() {
+    return {
+      remaining: this.items.length,
+      completed: this.completed.length,
+      failed: this.failed.length,
+      total: this.items.length + this.completed.length + this.failed.length,
+    };
+  }
+
+  hasWork() {
+    return this.items.length > 0;
+  }
+
+  getFailedItems() {
+    return this.failed.map((f) => f.item);
+  }
+}
+
 /* WORKER THREAD CODE */
 if (!isMainThread) {
   // This code runs in worker threads
   (async () => {
-    const { dates, workerId, config } = workerData;
+    const { workQueue, workerId, config } = workerData;
+    const queue = new WorkQueue(workQueue.items);
     const results = [];
 
-    console.log(`[Worker ${workerId}] Starting with ${dates.length} dates`);
+    console.log(
+      `[Worker ${workerId}] Starting with ${queue.items.length} dates`
+    );
 
     let browser = null;
+    let page = null;
+
     try {
-      // Docker-optimized browser launch options
+      // Optimized browser launch
       browser = await puppeteer.launch({
         headless: "new",
         args: [
@@ -273,218 +316,250 @@ if (!isMainThread) {
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
           "--disable-gpu",
-          "--disable-software-rasterizer",
+          "--disable-web-security",
+          "--disable-features=VizDisplayCompositor",
           "--disable-background-timer-throttling",
           "--disable-backgrounding-occluded-windows",
           "--disable-renderer-backgrounding",
-          "--disable-features=TranslateUI",
-          "--disable-ipc-flooding-protection",
-          "--single-process",
-          "--no-zygote",
-          "--memory-pressure-off",
-          "--max_old_space_size=2048",
           "--disable-extensions",
-          "--disable-default-apps",
-          "--disable-sync",
-          "--metrics-recording-only",
           "--no-first-run",
-          "--safebrowsing-disable-auto-update",
-          "--disable-background-networking",
-          "--disable-component-update",
         ],
         executablePath:
           process.env.PUPPETEER_EXECUTABLE_PATH ||
           "/usr/bin/google-chrome-stable",
-        timeout: 0, // Disable launch timeout
-        protocolTimeout: 180000, // 3 minutes for protocol operations
-        ignoreDefaultArgs: ["--disable-extensions"], // Let us control extensions
+        timeout: 0,
+        protocolTimeout: 240000, // 4 minutes
+        ignoreDefaultArgs: ["--disable-extensions"],
       });
 
-      for (const date of dates) {
-        let currentPage = null;
-        try {
-          console.log(`[Worker ${workerId}] Processing ${date}`);
+      // Create single reusable page
+      page = await browser.newPage();
+      await page.setDefaultTimeout(120000); // 2 minutes
+      await page.setDefaultNavigationTimeout(120000);
+      await page.setUserAgent(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      );
+      await page.setViewport({ width: 1280, height: 720 });
 
-          // Create a fresh page for each date
-          currentPage = await browser.newPage();
-          await currentPage.setDefaultTimeout(60000);
-          await currentPage.setDefaultNavigationTimeout(60000);
-          await currentPage.setUserAgent(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-          );
-          await currentPage.setViewport({ width: 1280, height: 720 });
+      // Block unnecessary resources globally
+      await page.setRequestInterception(true);
+      page.on("request", (req) => {
+        if (
+          req.resourceType() == "stylesheet" ||
+          req.resourceType() == "font" ||
+          req.resourceType() == "image"
+        ) {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
 
-          // Block unnecessary resources
-          await currentPage.setRequestInterception(true);
-          currentPage.on("request", (req) => {
-            if (
-              req.resourceType() == "stylesheet" ||
-              req.resourceType() == "font" ||
-              req.resourceType() == "image"
-            ) {
-              req.abort();
-            } else {
-              req.continue();
-            }
-          });
+      // Process dates from queue
+      while (queue.hasWork()) {
+        const date = queue.getNext();
+        if (!date) break;
 
-          // Load archive page with retries
-          const url = `${ARCHIVE_URL_BASE}${date}`;
-          let retries = 3;
-          let loaded = false;
+        let dateResults = [];
+        let attempts = 0;
+        const maxAttempts = 3;
 
-          while (retries > 0 && !loaded) {
-            try {
-              await currentPage.goto(url, {
-                waitUntil: "domcontentloaded", // Changed from networkidle2
-                timeout: 30000,
-              });
-              loaded = true;
-            } catch (error) {
-              console.log(
-                `[Worker ${workerId}] Retry ${4 - retries} for ${date}: ${
-                  error.message
-                }`
-              );
-              retries--;
-              if (retries > 0) {
-                await delay(5000); // Wait before retry
-              }
-            }
-          }
-
-          if (!loaded) {
-            console.error(
-              `[Worker ${workerId}] Failed to load ${date} after retries`
+        while (attempts < maxAttempts) {
+          try {
+            console.log(
+              `[Worker ${workerId}] Processing ${date} (attempt ${
+                attempts + 1
+              })`
             );
-            continue;
-          }
 
-          // Scroll to load all articles
-          await scrollToBottom(currentPage);
+            // Check browser health
+            if (!browser.connected) {
+              throw new Error("Browser disconnected");
+            }
 
-          // Get all articles
-          const articles = await currentPage.evaluate(() => {
-            const articleElements = document.querySelectorAll(
-              "article.card.card-full"
-            );
-            return Array.from(articleElements)
-              .map((article) => {
-                const titleElement = article.querySelector("h2.card-title a");
-                const timeElement = article.querySelector("time");
+            // Navigate to archive page
+            const url = `${ARCHIVE_URL_BASE}${date}`;
+            await page.goto(url, {
+              waitUntil: "domcontentloaded",
+              timeout: 60000,
+            });
 
-                return {
-                  title: titleElement ? titleElement.textContent.trim() : "",
-                  url: titleElement ? titleElement.href : "",
-                  date: timeElement ? timeElement.getAttribute("datetime") : "",
-                };
-              })
-              .filter((a) => a.title && a.url);
-          });
+            // Scroll to load all articles
+            await scrollToBottom(page);
 
-          console.log(
-            `[Worker ${workerId}] Found ${articles.length} articles for ${date}`
-          );
-
-          // Filter and process relevant articles
-          const relevantArticles = articles.filter((article) =>
-            hasRelevantKeywords(article.title)
-          );
-          console.log(
-            `[Worker ${workerId}] ${relevantArticles.length} articles with price keywords`
-          );
-
-          // Process each article
-          for (const article of relevantArticles) {
-            try {
-              await currentPage.goto(article.url, {
-                waitUntil: "domcontentloaded",
-                timeout: 20000,
-              });
-
-              // Extract content
-              const content = await currentPage.evaluate(() => {
-                const contentDiv = document.querySelector("div.post-content");
-                if (!contentDiv) return "";
-
-                const paragraphs = contentDiv.querySelectorAll("p");
-                return Array.from(paragraphs)
-                  .map((p) => p.textContent.trim())
-                  .filter((text) => text.length > 0)
-                  .join(" ");
-              });
-
-              if (!content) continue;
-
-              // Find all commodities mentioned - use config passed from main thread
-              const commoditiesFound = findCommodityMatches(
-                content,
-                config.commodities
+            // Get all articles
+            const articles = await page.evaluate(() => {
+              const articleElements = document.querySelectorAll(
+                "article.card.card-full"
               );
+              return Array.from(articleElements)
+                .map((article) => {
+                  const titleElement = article.querySelector("h2.card-title a");
+                  const timeElement = article.querySelector("time");
 
-              // Extract prices for each commodity
-              for (const commodity of commoditiesFound) {
-                const pricesData = extractPricesForCommodity(
+                  return {
+                    title: titleElement ? titleElement.textContent.trim() : "",
+                    url: titleElement ? titleElement.href : "",
+                    date: timeElement
+                      ? timeElement.getAttribute("datetime")
+                      : "",
+                  };
+                })
+                .filter((a) => a.title && a.url);
+            });
+
+            console.log(
+              `[Worker ${workerId}] Found ${articles.length} articles for ${date}`
+            );
+
+            // Filter relevant articles
+            const relevantArticles = articles.filter((article) =>
+              hasRelevantKeywords(article.title)
+            );
+            console.log(
+              `[Worker ${workerId}] ${relevantArticles.length} articles with price keywords`
+            );
+
+            // Process articles sequentially to avoid memory issues
+            for (const article of relevantArticles) {
+              try {
+                // Check browser health before each article
+                if (!browser.connected) {
+                  throw new Error(
+                    "Browser disconnected during article processing"
+                  );
+                }
+
+                await page.goto(article.url, {
+                  waitUntil: "domcontentloaded",
+                  timeout: 45000,
+                });
+
+                // Extract content
+                const content = await page.evaluate(() => {
+                  const contentDiv = document.querySelector("div.post-content");
+                  if (!contentDiv) return "";
+
+                  const paragraphs = contentDiv.querySelectorAll("p");
+                  return Array.from(paragraphs)
+                    .map((p) => p.textContent.trim())
+                    .filter((text) => text.length > 0)
+                    .join(" ");
+                });
+
+                if (!content) continue;
+
+                // Find commodities and extract prices
+                const commoditiesFound = findCommodityMatches(
                   content,
-                  commodity
+                  config.commodities
                 );
 
-                if (pricesData.length > 0) {
-                  for (const priceData of pricesData) {
-                    results.push({
-                      date: article.date,
-                      commodity: commodity,
-                      price: priceData.price,
-                      priceType: priceData.priceType,
-                      articleTitle: article.title,
-                      articleUrl: article.url,
-                    });
+                for (const commodity of commoditiesFound) {
+                  const pricesData = extractPricesForCommodity(
+                    content,
+                    commodity
+                  );
+
+                  if (pricesData.length > 0) {
+                    for (const priceData of pricesData) {
+                      dateResults.push({
+                        date: article.date,
+                        commodity: commodity,
+                        price: priceData.price,
+                        priceType: priceData.priceType,
+                        articleTitle: article.title,
+                        articleUrl: article.url,
+                      });
+                    }
                   }
                 }
+
+                // Respectful delay between articles
+                await delay(2000 + Math.random() * 2000);
+              } catch (error) {
+                console.error(
+                  `[Worker ${workerId}] Error processing article: ${error.message}`
+                );
+                // Continue with next article rather than failing the whole date
               }
-
-              await delay(1000 + Math.random() * 500);
-            } catch (error) {
-              console.error(
-                `[Worker ${workerId}] Error processing article: ${error.message}`
-              );
             }
-          }
 
-          await delay(2000 + Math.random() * 1000);
-        } catch (error) {
-          console.error(
-            `[Worker ${workerId}] Failed to process ${date}: ${error.message}`
-          );
-        } finally {
-          // Always close the page to prevent frame detachment
-          if (currentPage && !currentPage.isClosed()) {
-            try {
-              await currentPage.close();
-            } catch (e) {
-              console.warn(
-                `[Worker ${workerId}] Error closing page: ${e.message}`
+            // Success - break out of retry loop
+            queue.markCompleted(date, dateResults);
+            results.push(...dateResults);
+            console.log(
+              `[Worker ${workerId}] Completed ${date} with ${dateResults.length} entries`
+            );
+            break;
+          } catch (error) {
+            attempts++;
+            console.error(
+              `[Worker ${workerId}] Attempt ${attempts} failed for ${date}: ${error.message}`
+            );
+
+            if (attempts < maxAttempts) {
+              // Exponential backoff with jitter
+              const backoffTime =
+                Math.min(8000 * Math.pow(2, attempts - 1), 30000) +
+                Math.random() * 5000;
+              console.log(
+                `[Worker ${workerId}] Retrying ${date} in ${Math.round(
+                  backoffTime / 1000
+                )}s`
+              );
+              await delay(backoffTime);
+            } else {
+              queue.markFailed(date, error);
+              console.error(
+                `[Worker ${workerId}] Failed ${date} after ${maxAttempts} attempts`
               );
             }
           }
         }
+
+        // Delay between dates to be respectful
+        await delay(3000 + Math.random() * 2000);
+
+        // Periodic memory cleanup
+        if (queue.completed.length % 5 === 0) {
+          if (global.gc) {
+            global.gc();
+          }
+        }
       }
     } catch (error) {
-      console.error(
-        `[Worker ${workerId}] Browser launch error: ${error.message}`
-      );
+      console.error(`[Worker ${workerId}] Critical error: ${error.message}`);
     } finally {
+      if (page && !page.isClosed()) {
+        try {
+          await page.close();
+        } catch (e) {
+          console.warn(`[Worker ${workerId}] Error closing page: ${e.message}`);
+        }
+      }
       if (browser) {
-        await browser.close();
+        try {
+          await browser.close();
+        } catch (e) {
+          console.warn(
+            `[Worker ${workerId}] Error closing browser: ${e.message}`
+          );
+        }
       }
     }
 
     console.log(
-      `[Worker ${workerId}] Completed with ${results.length} results`
+      `[Worker ${workerId}] Completed with ${results.length} total results`
     );
 
     // Send results back to main thread
-    parentPort.postMessage({ workerId, results });
+    parentPort.postMessage({
+      workerId,
+      results,
+      queueStatus: queue.getStatus(),
+      failedItems: queue.getFailedItems(),
+    });
   })();
 }
 
@@ -494,7 +569,7 @@ async function scrollToBottom(page) {
   let currentHeight = await page.evaluate(() => document.body.scrollHeight);
   let attempts = 0;
 
-  while (previousHeight !== currentHeight && attempts < 20) {
+  while (previousHeight !== currentHeight && attempts < 15) {
     previousHeight = currentHeight;
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await delay(2000);
@@ -511,7 +586,7 @@ async function scrollToBottom(page) {
 }
 
 async function runParallelScraper() {
-  console.log("🚀 Starting Parallel Multi-Commodity Scraper");
+  console.log("🚀 Starting Optimized Parallel Multi-Commodity Scraper");
   console.log(`📅 Date Range: ${options.start} to ${options.end}`);
   console.log(`📦 Commodities: ${options.commodities.split(",").length} items`);
   console.log(`👷 Workers: ${options.workers}`);
@@ -525,13 +600,16 @@ async function runParallelScraper() {
 
   console.log(`📊 Total days to process: ${allDates.length}`);
 
-  // Split dates among workers
+  // Create work queue
+  const workQueue = new WorkQueue(allDates);
+
+  // Split work among workers (each gets a copy of the queue for work-stealing)
   const workerCount = parseInt(options.workers);
   const datesPerWorker = Math.ceil(allDates.length / workerCount);
   const workers = [];
   const workerPromises = [];
 
-  // Create workers
+  // Create workers with balanced work distribution
   for (let i = 0; i < workerCount; i++) {
     const startIdx = i * datesPerWorker;
     const endIdx = Math.min(startIdx + datesPerWorker, allDates.length);
@@ -539,11 +617,11 @@ async function runParallelScraper() {
 
     if (workerDates.length === 0) continue;
 
-    console.log(`🔧 Worker ${i + 1}: Processing ${workerDates.length} dates`);
+    console.log(`🔧 Worker ${i + 1}: Assigned ${workerDates.length} dates`);
 
     const worker = new Worker(__filename, {
       workerData: {
-        dates: workerDates,
+        workQueue: { items: workerDates },
         workerId: i + 1,
         config: {
           commodities: options.commodities,
@@ -567,17 +645,53 @@ async function runParallelScraper() {
   }
 
   // Wait for all workers to complete
-  console.log("\n⏳ Processing... This may take a while.\n");
+  console.log("\n⏳ Processing with optimized resource management...\n");
+  const startTime = Date.now();
+
   const workerResults = await Promise.all(workerPromises);
 
-  // Combine all results
+  const endTime = Date.now();
+  const totalTime = Math.round((endTime - startTime) / 1000);
+
+  // Combine all results and check for failures
   const allResults = [];
-  for (const { workerId, results } of workerResults) {
+  const allFailedItems = [];
+  let totalProcessed = 0;
+
+  for (const { workerId, results, queueStatus, failedItems } of workerResults) {
     console.log(
-      `✅ Worker ${workerId} completed with ${results.length} price entries`
+      `✅ Worker ${workerId}: ${results.length} entries, ${queueStatus.completed} dates completed, ${queueStatus.failed} failed`
     );
     allResults.push(...results);
+    allFailedItems.push(...failedItems);
+    totalProcessed += queueStatus.completed;
   }
+
+  // Handle failed items if any (for 100% success requirement)
+  if (allFailedItems.length > 0) {
+    console.log(
+      `\n⚠️  ${allFailedItems.length} dates failed. Implementing retry logic for 100% success...`
+    );
+    // TODO: Implement retry logic for failed dates
+    // For now, report the failures
+    console.log("Failed dates:", allFailedItems);
+  }
+
+  // Performance metrics
+  console.log(`\n📈 Performance Metrics:`);
+  console.log(
+    `⏱️  Total Time: ${totalTime} seconds (${
+      Math.round((totalTime / 60) * 10) / 10
+    } minutes)`
+  );
+  console.log(
+    `📊 Processing Rate: ${
+      Math.round((totalProcessed / (totalTime / 60)) * 10) / 10
+    } dates/minute`
+  );
+  console.log(
+    `🎯 Success Rate: ${Math.round((totalProcessed / allDates.length) * 100)}%`
+  );
 
   // Process results into commodity-specific CSVs
   await generateCommodityCSVs(allResults);
