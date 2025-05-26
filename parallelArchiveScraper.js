@@ -292,42 +292,41 @@ if (!isMainThread) {
           "--disable-background-networking",
           "--disable-component-update",
         ],
-        executablePath: "/usr/bin/chromium-browser",
+        executablePath:
+          process.env.PUPPETEER_EXECUTABLE_PATH ||
+          "/usr/bin/google-chrome-stable",
         timeout: 0, // Disable launch timeout
         protocolTimeout: 180000, // 3 minutes for protocol operations
         ignoreDefaultArgs: ["--disable-extensions"], // Let us control extensions
       });
 
-      const page = await browser.newPage();
-
-      // Set longer timeouts and better user agent
-      await page.setDefaultTimeout(60000);
-      await page.setDefaultNavigationTimeout(60000);
-
-      await page.setUserAgent(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      );
-
-      // Optimize page settings
-      await page.setViewport({ width: 1280, height: 720 });
-
-      // Block unnecessary resources for better performance
-      await page.setRequestInterception(true);
-      page.on("request", (req) => {
-        if (
-          req.resourceType() == "stylesheet" ||
-          req.resourceType() == "font" ||
-          req.resourceType() == "image"
-        ) {
-          req.abort();
-        } else {
-          req.continue();
-        }
-      });
-
       for (const date of dates) {
+        let currentPage = null;
         try {
           console.log(`[Worker ${workerId}] Processing ${date}`);
+
+          // Create a fresh page for each date
+          currentPage = await browser.newPage();
+          await currentPage.setDefaultTimeout(60000);
+          await currentPage.setDefaultNavigationTimeout(60000);
+          await currentPage.setUserAgent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          );
+          await currentPage.setViewport({ width: 1280, height: 720 });
+
+          // Block unnecessary resources
+          await currentPage.setRequestInterception(true);
+          currentPage.on("request", (req) => {
+            if (
+              req.resourceType() == "stylesheet" ||
+              req.resourceType() == "font" ||
+              req.resourceType() == "image"
+            ) {
+              req.abort();
+            } else {
+              req.continue();
+            }
+          });
 
           // Load archive page with retries
           const url = `${ARCHIVE_URL_BASE}${date}`;
@@ -336,7 +335,7 @@ if (!isMainThread) {
 
           while (retries > 0 && !loaded) {
             try {
-              await page.goto(url, {
+              await currentPage.goto(url, {
                 waitUntil: "domcontentloaded", // Changed from networkidle2
                 timeout: 30000,
               });
@@ -362,10 +361,10 @@ if (!isMainThread) {
           }
 
           // Scroll to load all articles
-          await scrollToBottom(page);
+          await scrollToBottom(currentPage);
 
           // Get all articles
-          const articles = await page.evaluate(() => {
+          const articles = await currentPage.evaluate(() => {
             const articleElements = document.querySelectorAll(
               "article.card.card-full"
             );
@@ -398,13 +397,13 @@ if (!isMainThread) {
           // Process each article
           for (const article of relevantArticles) {
             try {
-              await page.goto(article.url, {
+              await currentPage.goto(article.url, {
                 waitUntil: "domcontentloaded",
                 timeout: 20000,
               });
 
               // Extract content
-              const content = await page.evaluate(() => {
+              const content = await currentPage.evaluate(() => {
                 const contentDiv = document.querySelector("div.post-content");
                 if (!contentDiv) return "";
 
@@ -457,6 +456,17 @@ if (!isMainThread) {
           console.error(
             `[Worker ${workerId}] Failed to process ${date}: ${error.message}`
           );
+        } finally {
+          // Always close the page to prevent frame detachment
+          if (currentPage && !currentPage.isClosed()) {
+            try {
+              await currentPage.close();
+            } catch (e) {
+              console.warn(
+                `[Worker ${workerId}] Error closing page: ${e.message}`
+              );
+            }
+          }
         }
       }
     } catch (error) {
